@@ -9,7 +9,7 @@
 <body>
   <header class="topbar">
     <h1>单向抓包负载重组</h1>
-    <p class="subtitle">按字节偏移重组乱序分片 · 重叠同值去重 · 异值标冲突 · 列出全部缺口 · 优先级恢复裁决 · A/B 双次抓包差异定位 · 分片到达过程诊断</p>
+    <p class="subtitle">按字节偏移重组乱序分片 · 重叠同值去重 · 异值标冲突 · 列出全部缺口 · 优先级恢复裁决 · A/B 双次抓包差异定位 · 分片到达过程诊断 · 字节签名定位</p>
   </header>
 
   <main>
@@ -38,11 +38,28 @@
         <button id="submit" type="button" class="btn btn-primary">重组</button>
         <button id="prioSubmit" type="button" class="btn btn-primary">优先级恢复</button>
         <button id="traceSubmit" type="button" class="btn">诊断到达过程</button>
+        <button id="sigSubmit" type="button" class="btn">定位签名</button>
       </div>
       <div class="hint prio-hint">
         「重组」按录入顺序先到先得（同级异值即冲突）；「优先级恢复」逐字节只采用覆盖该位置的
         <b>最高优先级</b>片的裁决：同级异值仍标冲突，同级同值取最早录入片，更低优先级片的异值被忽略。
         优先级为整数（默认 0，负数亦可），越大越优先。
+      </div>
+
+      <div class="form-row sig-input-row">
+        <label for="sigPattern">字节签名</label>
+        <input id="sigPattern" type="text" spellcheck="false"
+               placeholder="如 48 65 ?? 6c（?? 通配该字节）" />
+        <label for="sigWinStart">起点窗口</label>
+        <input id="sigWinStart" type="text" value="0" spellcheck="false" />
+        <label for="sigWinLen">窗口长度</label>
+        <input id="sigWinLen" type="text" value="256" spellcheck="false" />
+        <button id="sigDemo" type="button" class="btn btn-ghost">填充签名示例</button>
+      </div>
+      <div class="hint">
+        「定位签名」沿用上方的预期长度与分片：签名 1～64 字节、至少一个确定字节，<code>??</code> 通配该位；
+        候选起点窗口一次最多检查 65536 个起点，签名越界的起点自动跳过。
+        确定字节唯一且相等为<b>确定命中</b>；落在缺口或含目标值的冲突上仅算<b>可能命中</b>。
       </div>
       <div id="error" class="error" hidden></div>
     </section>
@@ -186,6 +203,33 @@
       <div class="hint trace-note">诊断仅按录入顺序回放分片到达过程，不生成下载、不占用服务端结果缓存。</div>
     </section>
 
+    <section id="sigResultCard" class="card" hidden>
+      <h2>字节签名定位 · 结果</h2>
+
+      <div id="sigBanner" class="banner"></div>
+
+      <div class="stats" id="sigStats"></div>
+
+      <div class="two-columns">
+        <div class="column">
+          <h3>确定命中起点（所有确定字节唯一且相等）<span id="sigDefCount" class="count"></span></h3>
+          <ul id="sigDefList" class="range-list sig-def-list"></ul>
+        </div>
+        <div class="column">
+          <h3>可能命中起点（附不确定位原因）<span id="sigPosCount" class="count"></span></h3>
+          <ul id="sigPosList" class="range-list sig-pos-list"></ul>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button id="sigPrev" type="button" class="btn">← 上一窗口</button>
+        <button id="sigNext" type="button" class="btn">下一窗口 →</button>
+        <span class="hint">按当前窗口长度平移候选起点窗口，继续查找。</span>
+      </div>
+
+      <div class="hint trace-note">签名定位只读取分片覆盖状态做判定，不生成下载、不占用服务端结果缓存。</div>
+    </section>
+
     <section class="card">
       <h2>双次抓包差异定位（A/B 对比）· 输入</h2>
       <div class="form-row">
@@ -287,5 +331,6 @@
 
   <script src="/static/app.js"></script>
   <script src="/static/diff.js"></script>
+  <script src="/static/signature.js"></script>
 </body>
 </html>

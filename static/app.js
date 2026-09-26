@@ -92,6 +92,7 @@ function loadDemo(expected, frags) {
   document.getElementById("prioResultCard").hidden = true;
   els.error.hidden = true;
   document.getElementById("traceResultCard").hidden = true;
+  document.getElementById("sigResultCard").hidden = true;
 }
 
 els.addFrag.addEventListener("click", () => addFragment());

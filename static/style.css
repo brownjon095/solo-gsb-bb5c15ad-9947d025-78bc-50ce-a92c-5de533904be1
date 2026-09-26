@@ -167,6 +167,15 @@ main { max-width: 1180px; margin: 0 auto; padding: 20px 24px 40px; }
 .ab-side > h3 { margin-top: 0; }
 #diffWinStart, #diffWinLen { width: 120px; }
 
+/* 字节签名定位 */
+.sig-input-row { margin-top: 14px; }
+#sigPattern { width: 340px; }
+#sigWinStart, #sigWinLen { width: 110px; }
+.two-columns { display: grid; grid-template-columns: 1fr 1fr; gap: 14px; }
+@media (max-width: 900px) { .two-columns { grid-template-columns: 1fr; } }
+.sig-def-list li { color: var(--ok); }
+.sig-pos-list li { color: var(--warn); }
+
 .columns { display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 14px; }
 @media (max-width: 900px) { .columns { grid-template-columns: 1fr; } }
 

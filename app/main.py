@@ -1,4 +1,4 @@
-"""FastAPI 入口：重组 API、双次抓包差异定位 API、分片到达过程诊断 API、结果下载与静态页面托管。"""
+"""FastAPI 入口：重组 API、双次抓包差异定位 API、分片到达过程诊断 API、字节签名定位 API、结果下载与静态页面托管。"""
 
 from __future__ import annotations
 
@@ -17,12 +17,16 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt
 from .reassembly import (
     FIRST_CONFLICT_SAMPLE_LIMIT,
     MAX_DIFF_WINDOW as DEFAULT_MAX_DIFF_WINDOW,
+    MAX_SIGNATURE_LENGTH,
+    MAX_SIGNATURE_WINDOW as DEFAULT_MAX_SIGNATURE_WINDOW,
     PRIORITY_VALUE_LIMIT,
+    SIGNATURE_HIT_SAMPLE_LIMIT,
     ReassemblyError,
     arrival_trace as run_arrival_trace,
     assemble,
     assemble_priority,
     diff_captures,
+    locate_signature as run_signature_locate,
 )
 
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
@@ -33,6 +37,8 @@ MAX_FRAGMENTS = int(os.getenv("MAX_FRAGMENTS", "4096"))
 MAX_TOTAL_INPUT = int(os.getenv("MAX_TOTAL_INPUT", str(64 * 1024 * 1024)))
 # 双次抓包差异定位的比较窗口最大字节数
 MAX_DIFF_WINDOW = int(os.getenv("MAX_DIFF_WINDOW", str(DEFAULT_MAX_DIFF_WINDOW)))
+# 字节签名定位的候选起点窗口最多检查的起点数
+MAX_SIGNATURE_WINDOW = int(os.getenv("MAX_SIGNATURE_WINDOW", str(DEFAULT_MAX_SIGNATURE_WINDOW)))
 # 重组结果（含可下载字节）最多保留多少份 / 多久（秒）
 JOB_RETENTION_COUNT = int(os.getenv("JOB_RETENTION_COUNT", "100"))
 JOB_RETENTION_SECONDS = int(os.getenv("JOB_RETENTION_SECONDS", "1800"))
@@ -73,6 +79,19 @@ class DiffIn(BaseModel):
     fragments_b: list[FragmentIn] = Field(..., min_length=1, description="第二次抓包的分片")
 
 
+class SignatureLocateIn(BaseModel):
+    model_config = ConfigDict(extra="ignore", strict=True)
+
+    expected_length: StrictInt = Field(..., ge=0, description="预期还原负载的总字节数")
+    signature: str = Field(
+        ...,
+        description="字节签名：两位十六进制确定字节与 ?? 通配符，1～64 字节，至少一个确定字节",
+    )
+    window_start: StrictInt = Field(..., ge=0, description="候选起点窗口起始偏移，0 起算")
+    window_length: StrictInt = Field(..., ge=0, description="候选起点窗口检查的起点数，上限见 /api/health")
+    fragments: list[FragmentIn] = Field(..., min_length=1)
+
+
 # job_id -> (created_at, payload_bytes)
 _jobs: "OrderedDict[str, tuple[float, bytes]]" = OrderedDict()
 
@@ -96,8 +115,8 @@ def _store_job(payload: bytes) -> str:
 
 app = FastAPI(
     title="单向抓包负载重组工具",
-    description="按字节偏移重组乱序分片，标注重叠冲突与覆盖缺口；支持优先级恢复、A/B 双次抓包差异定位与分片到达过程诊断。",
-    version="1.3.0",
+    description="按字节偏移重组乱序分片，标注重叠冲突与覆盖缺口；支持优先级恢复、A/B 双次抓包差异定位、分片到达过程诊断与字节签名定位。",
+    version="1.4.0",
 )
 
 
@@ -115,6 +134,9 @@ async def health() -> dict[str, Any]:
             "max_fragments": MAX_FRAGMENTS,
             "max_total_input": MAX_TOTAL_INPUT,
             "max_diff_window": MAX_DIFF_WINDOW,
+            "max_signature_window": MAX_SIGNATURE_WINDOW,
+            "max_signature_length": MAX_SIGNATURE_LENGTH,
+            "signature_hit_sample_limit": SIGNATURE_HIT_SAMPLE_LIMIT,
             "max_first_conflict_samples": FIRST_CONFLICT_SAMPLE_LIMIT,
             "priority_value_limit": PRIORITY_VALUE_LIMIT,
         },
@@ -233,6 +255,37 @@ async def diff(body: DiffIn) -> dict[str, Any]:
         max_fragments=MAX_FRAGMENTS,
         max_total_input=MAX_TOTAL_INPUT,
         max_window=MAX_DIFF_WINDOW,
+    )
+
+
+@app.post("/api/signature-locate")
+async def signature_locate(body: SignatureLocateIn) -> dict[str, Any]:
+    """字节签名定位：在候选起点窗口内逐起点判定签名命中情况。
+
+    复用与 /api/reassemble 相同的 hex 解析、分片数、字节总量与预期长度上限；
+    签名由十六进制字节与 ?? 通配符组成（1～64 字节，至少一个确定字节）；
+    结果不写入下载缓存，不提供下载。
+    """
+    if body.expected_length > MAX_EXPECTED_LENGTH:
+        raise HTTPException(
+            status_code=400,
+            detail=f"预期字节数 {body.expected_length} 超过上限 {MAX_EXPECTED_LENGTH}",
+        )
+    if len(body.fragments) > MAX_FRAGMENTS:
+        raise HTTPException(
+            status_code=400,
+            detail=f"分片数量 {len(body.fragments)} 超过上限 {MAX_FRAGMENTS}",
+        )
+
+    return run_signature_locate(
+        body.expected_length,
+        [f.model_dump() for f in body.fragments],
+        body.signature,
+        body.window_start,
+        body.window_length,
+        max_fragments=MAX_FRAGMENTS,
+        max_total_input=MAX_TOTAL_INPUT,
+        max_window=MAX_SIGNATURE_WINDOW,
     )
 
 
