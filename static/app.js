@@ -92,6 +92,11 @@ function loadDemo(expected, frags) {
   document.getElementById("prioResultCard").hidden = true;
   els.error.hidden = true;
   document.getElementById("traceResultCard").hidden = true;
+  // 预期长度 / 分片被示例替换后，字节签名定位的旧结果同样失效
+  const sigCard = document.getElementById("sigResultCard");
+  if (sigCard) sigCard.hidden = true;
+  const sigError = document.getElementById("sigError");
+  if (sigError) sigError.hidden = true;
 }
 
 els.addFrag.addEventListener("click", () => addFragment());

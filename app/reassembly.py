@@ -44,6 +44,16 @@ FIRST_CONFLICT_SAMPLE_LIMIT = 2000
 # 优先级恢复中，单片优先级数值的允许范围（与 JS 安全整数对齐）
 PRIORITY_VALUE_LIMIT = 2**53 - 1
 
+# 字节签名定位中，签名长度（字节 / 通配位个数）的范围
+MIN_SIGNATURE_BYTES = 1
+MAX_SIGNATURE_BYTES = 64
+# 字节签名定位中，单次最多检查多少个候选起点
+MAX_SIGNATURE_WINDOW = 65536
+# 字节签名定位中，最多返回多少个命中起点（确定命中与可能命中合计）
+SIGNATURE_HIT_SAMPLE_LIMIT = 200
+# 字节签名定位中，每个不确定位最多展示几个冲突取值
+SIGNATURE_VALUE_SAMPLE_LIMIT = 8
+
 # 差异定位的逐字节类别
 CATEGORY_SAME = "same"  # 两侧均为唯一值且相等
 CATEGORY_DIFF = "diff"  # 两侧均为唯一值但不相等
@@ -751,3 +761,263 @@ def _mask_to_runs(mask: bytearray) -> list[list[int]]:
         runs.append([start, end])
         i = end + 1
     return runs
+
+
+# ------------------------------ 字节签名定位 ------------------------------
+
+# 逐起点判定结果
+SIG_HIT_DEFINITE = "definite"  # 确定命中：每个确定字节均唯一且相等
+SIG_HIT_POSSIBLE = "possible"  # 可能命中：存在缺口或含目标值的冲突
+SIG_REASON_GAP = "gap"  # 不确定位原因：该位无任何分片覆盖
+SIG_REASON_CONFLICT = "conflict"  # 不确定位原因：该位有冲突，且冲突取值中包含目标值
+
+
+def parse_signature(raw: str) -> list[int | None]:
+    """解析字节签名。
+
+    每个字节位写作两位十六进制（如 ``48``、``ff``）或通配符 ``??``，
+    允许空格、冒号、横线分隔；返回每项为 0~255 的确定字节或 None（通配）。
+    长度需在 1~64 字节之间，且至少包含一个确定字节。
+    """
+    if not isinstance(raw, str):
+        raise ReassemblyError("签名必须是字符串")
+    text = raw.replace(":", "").replace("-", "")
+    text = "".join(text.split()).lower()
+    if text == "":
+        raise ReassemblyError("签名为空")
+    if len(text) % 2 != 0:
+        raise ReassemblyError(
+            f"签名长度为奇数（{len(text)} 个字符），每个字节位需写两位 hex 或 ??"
+        )
+    tokens = [text[i : i + 2] for i in range(0, len(text), 2)]
+    if not (MIN_SIGNATURE_BYTES <= len(tokens) <= MAX_SIGNATURE_BYTES):
+        raise ReassemblyError(
+            f"签名长度 {len(tokens)} 字节超出允许范围 "
+            f"{MIN_SIGNATURE_BYTES}~{MAX_SIGNATURE_BYTES} 字节"
+        )
+    pattern: list[int | None] = []
+    for tok in tokens:
+        if tok == "??":
+            pattern.append(None)
+            continue
+        try:
+            pattern.append(int(tok, 16))
+        except ValueError:
+            raise ReassemblyError(
+                f"签名含非法字节位 {tok!r}：每位必须是两位十六进制或 ??"
+            ) from None
+    if not any(b is not None for b in pattern):
+        raise ReassemblyError("签名不能全部为 ?? 通配位，至少需要一个确定字节")
+    return pattern
+
+
+def _build_conflict_value_index(
+    expected_length: int,
+    parsed: list[tuple[int, bytes]],
+) -> tuple[bytearray, bytearray, dict[int, set[int]]]:
+    """构建逐字节状态与冲突位置 -> 该位置全部出现过的取值集合。
+
+    返回 (state, data, values)：
+      * state —— 0 缺口 / 1 唯一值 / 2 冲突；
+      * data  —— 唯一值位置的取值（先到先得）；
+      * values —— 冲突位置 -> 该位置出现过的**全部**不同取值（不限幅），
+        以便签名判定时确认目标值是否仍有可能成立。
+
+    与 _build_masks 采用相同的逐字节语义（先到先得、同值去重、异值标冲突）；
+    冲突集合的内存规模与输入字节总量同阶，受 max_total_input 约束。
+    """
+    state = bytearray(expected_length)  # 0 缺口 / 1 唯一 / 2 冲突
+    data = bytearray(expected_length)
+    values: dict[int, set[int]] = {}
+    for offset, payload in parsed:
+        for j, value in enumerate(payload):
+            pos = offset + j
+            st = state[pos]
+            if st == 0:
+                state[pos] = 1
+                data[pos] = value
+            elif st == 1:
+                if data[pos] != value:
+                    # 唯一值位置首次收到异值：升级为冲突，此时才建立取值集合
+                    state[pos] = 2
+                    values[pos] = {data[pos], value}
+            else:
+                values[pos].add(value)
+    return state, data, values
+
+
+def signature_scan(
+    expected_length: int,
+    fragments: list[dict[str, Any]],
+    signature: str,
+    window_start: int,
+    window_length: int,
+    *,
+    max_fragments: int,
+    max_total_input: int,
+    max_window: int = MAX_SIGNATURE_WINDOW,
+) -> dict[str, Any]:
+    """字节签名定位。
+
+    签名由确定字节（0~255）与 ``??`` 通配位组成。对候选起点窗口
+    [window_start, window_start + window_length) 内的每个起点 s
+    （要求 s + 签名长度 ≤ 预期长度，越界起点计入 out_of_bounds 且不参与判定），
+    按所有分片在每个确定字节位上的实际取值判定：
+
+      * 每个确定字节位都恰好有一个唯一取值且与目标相等 -> 确定命中；
+      * 某确定字节位为缺口，或为冲突且冲突取值中包含目标值（仍可能相等），
+        且不存在任何“唯一异值 / 不含目标值的冲突”位 -> 可能命中；
+      * 任一确定字节位有唯一异值，或冲突取值中不含目标值 -> 排除该起点；
+      * 通配位忽略，不作任何判断。
+
+    返回确定命中 / 可能命中总数（全窗口）、前 SIGNATURE_HIT_SAMPLE_LIMIT
+    个命中起点（两类混合按起点排序）以及每个可能命中的不确定位原因。
+    不生成下载、不进入下载缓存。
+    """
+    _check_expected_length(expected_length)
+    for name, value in (("窗口起点", window_start), ("窗口长度", window_length)):
+        if isinstance(value, bool) or not isinstance(value, int):
+            raise ReassemblyError(f"{name}必须是整数")
+    if window_start < 0:
+        raise ReassemblyError("窗口起点不能为负数")
+    if window_length < 1:
+        raise ReassemblyError("窗口长度至少为 1 字节")
+    if window_length > max_window:
+        raise ReassemblyError(f"窗口长度 {window_length} 超过上限 {max_window}")
+    if window_start > expected_length:
+        raise ReassemblyError(
+            f"窗口起点 {window_start} 超出预期长度 {expected_length}"
+        )
+
+    pattern = parse_signature(signature)
+    sig_len = len(pattern)
+    fixed = [(i, b) for i, b in enumerate(pattern) if b is not None]
+
+    # 复用单次重组的输入校验与上限（hex 解析、分片数、字节总量、越界）
+    parsed, total_input, _in_order = _parse_fragments(
+        expected_length,
+        fragments,
+        max_fragments=max_fragments,
+        max_total_input=max_total_input,
+    )
+    covered, data, values = _build_conflict_value_index(expected_length, parsed)
+
+    window_end = min(window_start + window_length, expected_length + 1)
+    # 起点 s 合法当且仅当 s + sig_len <= expected_length
+    last_valid_start = expected_length - sig_len
+
+    definite_count = 0
+    possible_count = 0
+    excluded_count = 0
+    out_of_bounds_count = 0
+    hits: list[dict[str, Any]] = []
+
+    for start in range(window_start, window_end):
+        if start > last_valid_start:
+            # 起点加上签名长度后越界：不参与判定
+            out_of_bounds_count += 1
+            continue
+
+        possible = False
+        uncertainties: list[dict[str, Any]] | None = None
+        excluded = False
+        for offset_in_sig, target in fixed:
+            pos = start + offset_in_sig
+            st = covered[pos]
+            if st == 0:
+                # 缺口：无法证明相等也无法证明不等
+                possible = True
+                if uncertainties is None:
+                    uncertainties = []
+                uncertainties.append(
+                    {
+                        "position": offset_in_sig,
+                        "offset": pos,
+                        "target": target,
+                        "reason": SIG_REASON_GAP,
+                    }
+                )
+                continue
+            if st == 1:
+                if data[pos] != target:
+                    # 唯一异值：该起点排除
+                    excluded = True
+                    break
+                continue
+            # 冲突位置：只有冲突取值中包含目标值时才仍可能命中
+            seen = values[pos]
+            if target not in seen:
+                excluded = True
+                break
+            possible = True
+            if uncertainties is None:
+                uncertainties = []
+            shown = sorted(seen)[:SIGNATURE_VALUE_SAMPLE_LIMIT]
+            uncertainties.append(
+                {
+                    "position": offset_in_sig,
+                    "offset": pos,
+                    "target": target,
+                    "reason": SIG_REASON_CONFLICT,
+                    "conflict_values": shown,
+                    "conflict_values_truncated": len(seen) > len(shown),
+                }
+            )
+
+        if excluded:
+            excluded_count += 1
+        elif possible:
+            possible_count += 1
+            hits.append(
+                {
+                    "start": start,
+                    "category": SIG_HIT_POSSIBLE,
+                    "uncertainties": uncertainties or [],
+                }
+            )
+        else:
+            definite_count += 1
+            hits.append(
+                {"start": start, "category": SIG_HIT_DEFINITE, "uncertainties": []}
+            )
+
+    # 两类命中混合按起点升序，仅保留前 SIGNATURE_HIT_SAMPLE_LIMIT 个
+    total_hits = len(hits)
+    hits.sort(key=lambda h: h["start"])
+    hits_truncated = total_hits > SIGNATURE_HIT_SAMPLE_LIMIT
+    hits = hits[:SIGNATURE_HIT_SAMPLE_LIMIT]
+
+    checked_count = definite_count + possible_count + excluded_count
+    pattern_hex = " ".join("??" if b is None else f"{b:02x}" for b in pattern)
+
+    return {
+        "expected_length": expected_length,
+        "signature": {
+            "hex": pattern_hex,
+            "length": sig_len,
+            "fixed_byte_count": len(fixed),
+            "wildcard_count": sig_len - len(fixed),
+        },
+        "window": {
+            "start": window_start,
+            "length": window_length,
+            "end": window_end,
+            "checked_count": checked_count,
+            "out_of_bounds_count": out_of_bounds_count,
+        },
+        "max_window_length": max_window,
+        "total_candidate_starts": max(0, expected_length - sig_len + 1),
+        "counts": {
+            "definite": definite_count,
+            "possible": possible_count,
+            "excluded": excluded_count,
+            "out_of_bounds": out_of_bounds_count,
+        },
+        "hits": hits,
+        "hits_truncated": hits_truncated,
+        "hit_sample_limit": SIGNATURE_HIT_SAMPLE_LIMIT,
+        "stats": {
+            "fragment_count": len(parsed),
+            "total_input_bytes": total_input,
+        },
+    }

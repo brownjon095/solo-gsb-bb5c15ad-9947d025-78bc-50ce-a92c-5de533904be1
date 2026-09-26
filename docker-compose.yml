@@ -14,6 +14,8 @@ services:
       MAX_TOTAL_INPUT: "67108864"
       # 双次抓包差异定位的比较窗口最大字节数（默认 65536）
       MAX_DIFF_WINDOW: "65536"
+      # 字节签名定位单次最多检查的候选起点数（默认 65536）
+      MAX_SIGNATURE_WINDOW: "65536"
       # 可下载结果在内存中的保留份数 / 秒数
       JOB_RETENTION_COUNT: "100"
       JOB_RETENTION_SECONDS: "1800"

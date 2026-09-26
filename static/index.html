@@ -9,7 +9,7 @@
 <body>
   <header class="topbar">
     <h1>单向抓包负载重组</h1>
-    <p class="subtitle">按字节偏移重组乱序分片 · 重叠同值去重 · 异值标冲突 · 列出全部缺口 · 优先级恢复裁决 · A/B 双次抓包差异定位 · 分片到达过程诊断</p>
+    <p class="subtitle">按字节偏移重组乱序分片 · 重叠同值去重 · 异值标冲突 · 列出全部缺口 · 优先级恢复裁决 · A/B 双次抓包差异定位 · 分片到达过程诊断 · 字节签名定位</p>
   </header>
 
   <main>
@@ -45,6 +45,27 @@
         优先级为整数（默认 0，负数亦可），越大越优先。
       </div>
       <div id="error" class="error" hidden></div>
+
+      <div class="sig-divider">
+        <h3>字节签名定位（沿用上方预期长度与分片）</h3>
+        <div class="form-row sig-row">
+          <label for="sigPattern">字节签名</label>
+          <input id="sigPattern" type="text" class="sig-input" spellcheck="false"
+                 placeholder="如 48 65 ?? ?? 6f 或 48:65:??:6f" />
+          <label for="sigWinStart">窗口起点</label>
+          <input id="sigWinStart" type="text" value="0" class="sig-win" spellcheck="false" />
+          <label for="sigWinLen">窗口长度</label>
+          <input id="sigWinLen" type="text" value="65536" class="sig-win" spellcheck="false" />
+          <span class="hint">签名为 1～64 个字节位（两位 hex 或 <code>??</code> 通配），至少 1 个确定字节；窗口最多检查 65536 个候选起点，越界起点不参与。</span>
+        </div>
+        <div class="btn-row">
+          <button id="sigSubmit" type="button" class="btn btn-primary">签名定位</button>
+          <button id="sigPrev" type="button" class="btn">← 上一窗口</button>
+          <button id="sigNext" type="button" class="btn">下一窗口 →</button>
+          <button id="sigDemo" type="button" class="btn btn-ghost">填充签名示例</button>
+        </div>
+        <div id="sigError" class="error" hidden></div>
+      </div>
     </section>
 
     <section id="resultCard" class="card" hidden>
@@ -186,6 +207,33 @@
       <div class="hint trace-note">诊断仅按录入顺序回放分片到达过程，不生成下载、不占用服务端结果缓存。</div>
     </section>
 
+    <section id="sigResultCard" class="card" hidden>
+      <h2>字节签名定位 · 结果</h2>
+
+      <div id="sigBanner" class="banner"></div>
+
+      <div class="stats" id="sigStats"></div>
+
+      <h3>命中起点（确定命中与可能命中混合，按起点排序，最多 200 个）</h3>
+      <div class="table-wrap trace-table-wrap">
+        <table id="sigHitTable">
+          <thead>
+            <tr>
+              <th>候选起点</th><th>类型</th><th>覆盖范围</th><th>不确定位原因（可能命中）</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="sigHitNote" class="hint"></div>
+
+      <div class="btn-row">
+        <button id="sigPrev2" type="button" class="btn">← 上一窗口</button>
+        <button id="sigNext2" type="button" class="btn">下一窗口 →</button>
+        <span class="hint">按当前窗口长度平移窗口，继续查找后续起点。</span>
+      </div>
+    </section>
+
     <section class="card">
       <h2>双次抓包差异定位（A/B 对比）· 输入</h2>
       <div class="form-row">
@@ -286,6 +334,7 @@
   </footer>
 
   <script src="/static/app.js"></script>
+  <script src="/static/signature.js"></script>
   <script src="/static/diff.js"></script>
 </body>
 </html>
