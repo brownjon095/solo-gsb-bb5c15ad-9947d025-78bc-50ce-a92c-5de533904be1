@@ -1,0 +1,25 @@
+services:
+  reassembler:
+    build: .
+    image: pcap-reassembler:latest
+    container_name: pcap-reassembler
+    ports:
+      - "8000:8000"
+    environment:
+      # 单个任务预期负载的最大字节数（默认 16 MiB）
+      MAX_EXPECTED_LENGTH: "16777216"
+      # 单次请求最多提交多少个分片
+      MAX_FRAGMENTS: "4096"
+      # 所有分片原始字节总量上限（默认 64 MiB）
+      MAX_TOTAL_INPUT: "67108864"
+      # 双次抓包差异定位的比较窗口最大字节数（默认 65536）
+      MAX_DIFF_WINDOW: "65536"
+      # 可下载结果在内存中的保留份数 / 秒数
+      JOB_RETENTION_COUNT: "100"
+      JOB_RETENTION_SECONDS: "1800"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/api/health').status==200 else 1)"]
+      interval: 30s
+      timeout: 5s
+      retries: 3

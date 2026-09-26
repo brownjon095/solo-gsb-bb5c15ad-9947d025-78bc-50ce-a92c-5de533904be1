@@ -1,0 +1,291 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>单向抓包负载重组与差异定位</title>
+  <link rel="stylesheet" href="/static/style.css" />
+</head>
+<body>
+  <header class="topbar">
+    <h1>单向抓包负载重组</h1>
+    <p class="subtitle">按字节偏移重组乱序分片 · 重叠同值去重 · 异值标冲突 · 列出全部缺口 · 优先级恢复裁决 · A/B 双次抓包差异定位 · 分片到达过程诊断</p>
+  </header>
+
+  <main>
+    <section class="card">
+      <h2>单次重组 · 输入</h2>
+      <div class="form-row">
+        <label for="expectedLength">预期字节数</label>
+        <input id="expectedLength" type="text" value="16" spellcheck="false"
+               placeholder="十进制或 0x 十六进制" />
+        <span class="hint">负载从偏移 0 到该长度，区间左闭右开。</span>
+      </div>
+
+      <div class="frag-head single-frag-head">
+        <span class="col-offset">起始偏移</span>
+        <span class="col-priority">优先级</span>
+        <span class="col-data">十六进制内容（允许空格 / 冒号分隔）</span>
+        <span class="col-op"></span>
+      </div>
+      <div id="fragments"></div>
+
+      <div class="btn-row">
+        <button id="addFrag" type="button" class="btn">＋ 添加分片</button>
+        <button id="loadDemoGap" type="button" class="btn btn-ghost">填充示例：乱序+冲突+缺口</button>
+        <button id="loadDemoOk" type="button" class="btn btn-ghost">填充示例：完整可下载</button>
+        <button id="loadDemoPrio" type="button" class="btn btn-ghost">填充示例：优先级恢复</button>
+        <button id="submit" type="button" class="btn btn-primary">重组</button>
+        <button id="prioSubmit" type="button" class="btn btn-primary">优先级恢复</button>
+        <button id="traceSubmit" type="button" class="btn">诊断到达过程</button>
+      </div>
+      <div class="hint prio-hint">
+        「重组」按录入顺序先到先得（同级异值即冲突）；「优先级恢复」逐字节只采用覆盖该位置的
+        <b>最高优先级</b>片的裁决：同级异值仍标冲突，同级同值取最早录入片，更低优先级片的异值被忽略。
+        优先级为整数（默认 0，负数亦可），越大越优先。
+      </div>
+      <div id="error" class="error" hidden></div>
+    </section>
+
+    <section id="resultCard" class="card" hidden>
+      <h2>单次重组 · 结果</h2>
+
+      <div id="banner" class="banner"></div>
+
+      <div class="stats" id="stats"></div>
+
+      <h3>覆盖示意图（偏移 0 → 预期长度）</h3>
+      <div class="legend">
+        <span class="lg lg-covered">覆盖</span>
+        <span class="lg lg-conflict">冲突</span>
+        <span class="lg lg-gap">缺口</span>
+        <span id="barHint" class="hint"></span>
+      </div>
+      <div id="coverageBar" class="coverage-bar"></div>
+
+      <div class="columns">
+        <div class="column">
+          <h3>覆盖区间 <span id="coveredCount" class="count"></span></h3>
+          <ul id="coveredList" class="range-list"></ul>
+        </div>
+        <div class="column">
+          <h3>冲突区间 <span id="conflictCount" class="count"></span></h3>
+          <ul id="conflictList" class="range-list conflict-list"></ul>
+          <div id="conflictSamples" class="samples"></div>
+        </div>
+        <div class="column">
+          <h3>缺口区间（[0, 预期长度) 内全部未覆盖位置）<span id="gapCount" class="count"></span></h3>
+          <ul id="gapList" class="range-list gap-list"></ul>
+        </div>
+      </div>
+
+      <h3>提交的分片（按提交顺序）</h3>
+      <div class="table-wrap">
+        <table id="fragTable">
+          <thead>
+            <tr><th>#</th><th>起始偏移</th><th>长度</th><th>覆盖范围</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <h3>字节预览（取最先到达的值，每 16 字节一行；灰色为缺口位置）</h3>
+      <pre id="preview" class="preview"></pre>
+
+      <div class="download-row">
+        <button id="downloadBtn" type="button" class="btn btn-download" hidden>⬇ 下载还原的二进制</button>
+        <span id="downloadNote" class="hint"></span>
+      </div>
+    </section>
+
+    <section id="prioResultCard" class="card" hidden>
+      <h2>优先级恢复 · 裁决结果</h2>
+
+      <div id="prioBanner" class="banner"></div>
+
+      <div class="stats" id="prioStats"></div>
+
+      <h3>裁决示意图（偏移 0 → 预期长度）</h3>
+      <div class="legend">
+        <span class="lg lg-covered">已裁决</span>
+        <span class="lg lg-conflict">未决冲突</span>
+        <span class="lg lg-gap">缺口</span>
+        <span id="prioBarHint" class="hint"></span>
+      </div>
+      <div id="prioBar" class="coverage-bar"></div>
+
+      <div class="columns">
+        <div class="column">
+          <h3>获胜来源区间（连续相同获胜片，半开区间）<span id="prioSourceCount" class="count"></span></h3>
+          <ul id="prioSourceList" class="range-list source-list"></ul>
+        </div>
+        <div class="column">
+          <h3>未决冲突区间（最高优先级层出现异值）<span id="prioConflictCount" class="count"></span></h3>
+          <ul id="prioConflictList" class="range-list conflict-list"></ul>
+          <div id="prioConflictSamples" class="samples"></div>
+        </div>
+        <div class="column">
+          <h3>缺口区间（无任何分片覆盖）<span id="prioGapCount" class="count"></span></h3>
+          <ul id="prioGapList" class="range-list gap-list"></ul>
+        </div>
+      </div>
+
+      <h3>提交的分片（按提交顺序；优先级越大越优先）</h3>
+      <div class="table-wrap">
+        <table id="prioFragTable">
+          <thead>
+            <tr><th>#</th><th>优先级</th><th>起始偏移</th><th>长度</th><th>覆盖范围</th></tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <h3>字节预览（每 16 字节一行；红色为未决冲突，灰色为缺口）</h3>
+      <pre id="prioPreview" class="preview"></pre>
+
+      <div class="download-row">
+        <button id="prioDownloadBtn" type="button" class="btn btn-download" hidden>⬇ 下载裁决后的二进制</button>
+        <span id="prioDownloadNote" class="hint"></span>
+      </div>
+    </section>
+
+    <section id="traceResultCard" class="card" hidden>
+      <h2>分片到达过程诊断 · 结果</h2>
+
+      <div id="traceBanner" class="banner"></div>
+
+      <div class="stats" id="traceStats"></div>
+
+      <h3>到达步骤表（按录入顺序逐片应用；红字行为引入新冲突的分片）</h3>
+      <div class="table-wrap trace-table-wrap">
+        <table id="traceTable">
+          <thead>
+            <tr>
+              <th>#</th><th>起始偏移</th><th>长度</th><th>覆盖范围</th>
+              <th>新增覆盖</th><th>新增冲突</th><th>累计覆盖</th><th>累计冲突</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+
+      <h3>首次冲突样本 <span id="traceSampleCount" class="count"></span></h3>
+      <div class="table-wrap trace-table-wrap">
+        <table id="traceSampleTable">
+          <thead>
+            <tr>
+              <th>偏移</th><th>最先写入的分片</th><th>原值</th>
+              <th>触发冲突的分片</th><th>冲突值</th>
+            </tr>
+          </thead>
+          <tbody></tbody>
+        </table>
+      </div>
+      <div id="traceSampleNote" class="hint"></div>
+
+      <div class="hint trace-note">诊断仅按录入顺序回放分片到达过程，不生成下载、不占用服务端结果缓存。</div>
+    </section>
+
+    <section class="card">
+      <h2>双次抓包差异定位（A/B 对比）· 输入</h2>
+      <div class="form-row">
+        <label for="diffExpected">预期字节数</label>
+        <input id="diffExpected" type="text" value="24" spellcheck="false"
+               placeholder="十进制或 0x 十六进制" />
+        <label for="diffWinStart">窗口起点</label>
+        <input id="diffWinStart" type="text" value="0" spellcheck="false" />
+        <label for="diffWinLen">窗口长度</label>
+        <input id="diffWinLen" type="text" value="24" spellcheck="false" />
+        <span class="hint">窗口须落在 [0, 预期长度) 内，长度 ≤ 65536 字节；A/B 两组共用同一预期长度。</span>
+      </div>
+
+      <div class="ab-columns">
+        <div class="ab-side">
+          <h3>A 侧分片（第一次抓包）</h3>
+          <div class="frag-head">
+            <span class="col-offset">起始偏移</span>
+            <span class="col-data">十六进制内容（允许空格 / 冒号分隔）</span>
+            <span class="col-op"></span>
+          </div>
+          <div id="fragmentsA"></div>
+          <div class="btn-row">
+            <button id="addFragA" type="button" class="btn">＋ 添加 A 侧分片</button>
+          </div>
+        </div>
+        <div class="ab-side">
+          <h3>B 侧分片（第二次抓包）</h3>
+          <div class="frag-head">
+            <span class="col-offset">起始偏移</span>
+            <span class="col-data">十六进制内容（允许空格 / 冒号分隔）</span>
+            <span class="col-op"></span>
+          </div>
+          <div id="fragmentsB"></div>
+          <div class="btn-row">
+            <button id="addFragB" type="button" class="btn">＋ 添加 B 侧分片</button>
+          </div>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button id="diffDemo" type="button" class="btn btn-ghost">填充对比示例</button>
+        <button id="diffSubmit" type="button" class="btn btn-primary">对比</button>
+        <button id="diffPrev" type="button" class="btn">← 上一窗口</button>
+        <button id="diffNext" type="button" class="btn">下一窗口 →</button>
+      </div>
+      <div id="diffError" class="error" hidden></div>
+    </section>
+
+    <section id="diffResultCard" class="card" hidden>
+      <h2>差异定位结果</h2>
+
+      <div id="diffBanner" class="banner"></div>
+
+      <div class="stats" id="diffStats"></div>
+
+      <h3>窗口示意图（窗口起点 → 窗口终点）</h3>
+      <div class="legend">
+        <span class="lg lg-covered">相同</span>
+        <span class="lg lg-conflict">不同</span>
+        <span class="lg lg-undecidable">不可判定</span>
+        <span id="diffBarHint" class="hint"></span>
+      </div>
+      <div id="diffBar" class="coverage-bar"></div>
+
+      <div class="columns">
+        <div class="column">
+          <h3>差异区间（两侧均为唯一值但取值不同）<span id="diffCount" class="count"></span></h3>
+          <ul id="diffList" class="range-list conflict-list"></ul>
+        </div>
+        <div class="column">
+          <h3>不可判定区间（标明两侧原因）<span id="undecidableCount" class="count"></span></h3>
+          <ul id="undecidableList" class="range-list undecidable-list"></ul>
+        </div>
+        <div class="column">
+          <h3>两侧整体状况（整个 [0, 预期长度)）</h3>
+          <div class="table-wrap">
+            <table id="sideTable">
+              <thead>
+                <tr><th></th><th>A 侧</th><th>B 侧</th></tr>
+              </thead>
+              <tbody></tbody>
+            </table>
+          </div>
+        </div>
+      </div>
+
+      <div class="btn-row">
+        <button id="diffPrev2" type="button" class="btn">← 上一窗口</button>
+        <button id="diffNext2" type="button" class="btn">下一窗口 →</button>
+        <span class="hint">按当前窗口长度平移窗口，查看后续位置。</span>
+      </div>
+    </section>
+  </main>
+
+  <footer class="footer">
+    结果仅在服务端内存中临时保留（默认 100 份 / 30 分钟），过期需重新重组。
+  </footer>
+
+  <script src="/static/app.js"></script>
+  <script src="/static/diff.js"></script>
+</body>
+</html>
